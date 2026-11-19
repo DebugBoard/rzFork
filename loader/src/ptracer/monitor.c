@@ -3,10 +3,15 @@
 #include <time.h>
 #include <errno.h>
 
+#include <fcntl.h>
+#include <poll.h>
+#include <sched.h>
 #include <unistd.h>
 #include <sys/epoll.h>
+#include <sys/mount.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 
@@ -552,6 +557,143 @@ static bool ensure_daemon_created(bool is_64bit) {
     }                                                              \
   }
 
+#define ZYGOTE_NEXT "/system/bin/zygote_next"
+
+/* INFO: Unmounts the last root mount listed, so children go before parents. */
+static bool umount_last_root_mount(void) {
+  FILE *mountinfo = fopen("/proc/self/mountinfo", "re");
+  if (mountinfo == NULL) {
+    PLOGE("open mountinfo");
+
+    return false;
+  }
+
+  char last_target[PATH_MAX];
+  bool found = false;
+
+  char line[PATH_MAX * 3];
+  while (fgets(line, sizeof(line), mountinfo) != NULL) {
+    char root[PATH_MAX];
+    char target[PATH_MAX];
+    char source[PATH_MAX];
+
+    const char *separator = strstr(line, " - ");
+    if (separator == NULL) continue;
+
+    if (sscanf(line, "%*d %*d %*s %4095s %4095s", root, target) != 2) continue;
+    if (sscanf(separator + strlen(" - "), "%*s %4095s", source) != 1) continue;
+
+    bool should_unmount = strcmp(source, "KSU") == 0 || strcmp(source, "APatch") == 0 || strcmp(source, "magisk") == 0;
+    if (strncmp(target, "/data/adb/modules", strlen("/data/adb/modules")) == 0) should_unmount = true;
+    if (strncmp(root, "/adb/modules/", strlen("/adb/modules/")) == 0) should_unmount = true;
+
+    if (!should_unmount) continue;
+
+    strcpy(last_target, target);
+    found = true;
+  }
+
+  fclose(mountinfo);
+
+  if (!found) return false;
+
+  if (umount2(last_target, MNT_DETACH) == -1) {
+    PLOGE("unmount %s", last_target);
+
+    return false;
+  }
+
+  LOGI("Unmounted %s from zygote_next", last_target);
+
+  return true;
+}
+
+static void umount_root_mounts(void) {
+  while (umount_last_root_mount());
+}
+
+/* INFO: Slave of init's so unmounts don't propagate back, shared again as in stock,
+           and cleaned whenever the mounts change. */
+static void keep_mount_namespace_clean(pid_t pid) {
+  char ns_path[PATH_MAX];
+  snprintf(ns_path, sizeof(ns_path), "/proc/%d/ns/mnt", pid);
+
+  int ns_fd = open(ns_path, O_RDONLY | O_CLOEXEC);
+  if (ns_fd == -1 || setns(ns_fd, CLONE_NEWNS) == -1) {
+    PLOGE("enter mount namespace of zygote_next %d", pid);
+
+    return;
+  }
+  close(ns_fd);
+
+  if (mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL) == -1 || mount(NULL, "/", NULL, MS_REC | MS_SHARED, NULL) == -1) {
+    PLOGE("set propagation of mount namespace of zygote_next %d", pid);
+
+    return;
+  }
+
+  struct pollfd fds[2] = {
+    { .fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC), .events = POLLPRI },
+    { .fd = (int)syscall(SYS_pidfd_open, pid, 0), .events = POLLIN }
+  };
+
+  if (fds[0].fd == -1 || fds[1].fd == -1) {
+    PLOGE("watch mount namespace of zygote_next %d", pid);
+
+    umount_root_mounts();
+
+    return;
+  }
+
+  /* INFO: Runs until zygote_next exits. */
+  do {
+    umount_root_mounts();
+  } while ((poll(fds, 2, -1) != -1 || errno == EINTR) && fds[1].revents == 0);
+}
+
+/* INFO: zygote_next stays in init's mount namespace, exposing root mounts to its children. */
+static void isolate_zygote_next(pid_t pid) {
+  /* INFO: Leave execve first, it would overwrite a remote syscall's registers. */
+  int status;
+  if (ptrace(PTRACE_SYSCALL, pid, 0, 0) == -1 || !wait_for_ptrace_syscall_stop(pid, &status)) {
+    LOGE("Failed to leave execve of zygote_next %d", pid);
+
+    return;
+  }
+
+  char pid_str[32];
+  snprintf(pid_str, sizeof(pid_str), "%d", pid);
+
+  struct maps_info *map = parse_maps(pid_str);
+  if (map == NULL) {
+    LOGE("Failed to parse maps of zygote_next %d", pid);
+
+    return;
+  }
+
+  uintptr_t syscall_gadget = find_syscall_gadget(pid, map);
+  free_maps(map);
+
+  struct user_regs_struct regs;
+  if (syscall_gadget == 0 || !get_regs(pid, &regs)) return;
+
+  long args[] = { CLONE_NEWNS };
+  long ret = remote_syscall(pid, &regs, syscall_gadget, SYS_unshare, args, 1);
+  if (ret != 0) {
+    LOGE("Failed to unshare mount namespace of zygote_next %d: %ld", pid, ret);
+
+    return;
+  }
+
+  LOGI("Unshared mount namespace of zygote_next %d", pid);
+
+  if (fork_dont_care() == 0) {
+    keep_mount_namespace_clean(pid);
+
+    _exit(0);
+  }
+}
+
 int sigchld_signal_fd;
 struct signalfd_siginfo sigchld_fdsi;
 int sigchld_status;
@@ -725,6 +867,12 @@ void sigchld_listener_callback() {
           do {
             if (tracing_state != TRACING) {
               LOGD("Stopped injecting %d because status is not set to tracing", pid);
+
+              break;
+            }
+
+            if (strcmp(program, ZYGOTE_NEXT) == 0) {
+              isolate_zygote_next(pid);
 
               break;
             }
